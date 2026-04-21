@@ -1,0 +1,9 @@
+# Install PyTorch and PyTorch Geometric separately for your CPU/CUDA platform.
+# Graph-RHO has been exercised with torch 2.x, torch_geometric 2.x, and ortools 9.9.
+
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+ortools>=9.9
+tqdm>=4.66
+tensorboard>=2.12

@@ -1,0 +1,445 @@
+diff -urN makespan/critical_path_utils.py makespan/critical_path_utils.py
+--- makespan/critical_path_utils.py	1969-12-31 19:00:00.000000000 -0500
++++ makespan/critical_path_utils.py	2026-04-21 04:59:07.226007708 -0400
+@@ -0,0 +1,287 @@
++"""
++Critical Path Computation Utilities for Job Shop Scheduling.
++
++This module provides functions to identify critical path tasks from a CP-SAT solution.
++Critical path = the longest chain of dependent tasks that determines the makespan.
++Tasks on the critical path have zero slack (no room for delay without increasing makespan).
++
++Key Concepts:
++- Earliest Start Time (EST): Earliest possible start time considering all predecessors
++- Latest Start Time (LST): Latest possible start time without delaying makespan
++- Slack = LST - EST: Tasks with slack=0 are on the critical path
++"""
++
++import numpy as np
++from collections import defaultdict
++from typing import Dict, Set, Tuple, List, Optional
++
++EPS = 1e-5
++
++
++def compute_critical_path(
++    jobs_data_sel: Dict,
++    jobs_solution: Dict,
++    machines_assignment: Dict,
++    n_machines: int,
++    makespan: Optional[int] = None
++) -> Set[Tuple[int, int]]:
++    """
++    Compute critical path tasks from a CP-SAT solution.
++
++    Critical path is determined by tasks with zero slack:
++    - Forward pass: Compute earliest start/end times
++    - Backward pass: Compute latest start/end times from makespan
++    - Critical tasks: slack = latest_start - earliest_start ≈ 0
++
++    Args:
++        jobs_data_sel: {job_id: {task_id: {alt_id: (duration, machine)}}}
++        jobs_solution: {(job_id, task_id): (selected_alt, machine, start_value, duration)}
++        machines_assignment: {machine: [assigned_task_type(start, job, index, duration)]}
++        n_machines: Number of machines
++        makespan: Optional makespan value (computed if not provided)
++
++    Returns:
++        Set of (job_id, task_id) tuples that are on the critical path
++    """
++    if len(jobs_solution) == 0:
++        return set()
++
++    # Extract solution info
++    task_info = {}  # (job_id, task_id) -> (start, end, machine)
++    for (job_id, task_id), sol in jobs_solution.items():
++        selected_alt, machine, start_value, duration = sol
++        end_value = start_value + duration
++        task_info[(job_id, task_id)] = (start_value, end_value, machine, duration)
++
++    # Compute makespan if not provided
++    if makespan is None:
++        makespan = max(info[1] for info in task_info.values())
++
++    # Build dependency graph
++    # 1. Job precedence: within each job, tasks must execute in order
++    job_successors = defaultdict(list)  # task -> list of successor tasks in same job
++    job_predecessors = defaultdict(list)  # task -> list of predecessor tasks in same job
++
++    for job_id, job in jobs_data_sel.items():
++        task_ids = sorted(job.keys())
++        for i in range(len(task_ids) - 1):
++            curr_task = (job_id, task_ids[i])
++            next_task = (job_id, task_ids[i + 1])
++            if curr_task in task_info and next_task in task_info:
++                job_successors[curr_task].append(next_task)
++                job_predecessors[next_task].append(curr_task)
++
++    # 2. Machine sequence: tasks on same machine must not overlap
++    # Build machine sequences from actual assignment
++    machine_sequences = defaultdict(list)  # machine -> list of tasks sorted by start time
++    for machine in range(n_machines):
++        if machine in machines_assignment:
++            tasks_on_machine = [(task.start, (task.job, task.index))
++                                for task in machines_assignment[machine]
++                                if (task.job, task.index) in task_info]
++            tasks_on_machine.sort()
++            machine_sequences[machine] = [task for _, task in tasks_on_machine]
++
++    machine_successors = defaultdict(list)  # task -> list of successor tasks on same machine
++    machine_predecessors = defaultdict(list)  # task -> list of predecessor tasks on same machine
++
++    for machine, task_list in machine_sequences.items():
++        for i in range(len(task_list) - 1):
++            curr_task = task_list[i]
++            next_task = task_list[i + 1]
++            machine_successors[curr_task].append(next_task)
++            machine_predecessors[next_task].append(curr_task)
++
++    # Forward pass: Compute earliest start/end times
++    # These are actually already in the solution (the solver computed optimal times)
++    earliest_start = {task: info[0] for task, info in task_info.items()}
++    earliest_end = {task: info[1] for task, info in task_info.items()}
++
++    # Backward pass: Compute latest start/end times
++    latest_end = {}
++    latest_start = {}
++
++    # Initialize: tasks that end at makespan have latest_end = makespan
++    # Process in reverse topological order
++    all_tasks = list(task_info.keys())
++
++    # Sort by end time descending for backward pass
++    all_tasks_sorted = sorted(all_tasks, key=lambda t: -earliest_end[t])
++
++    for task in all_tasks_sorted:
++        start, end, machine, duration = task_info[task]
++
++        # Latest end is min of:
++        # 1. Makespan (if no successor)
++        # 2. Latest start of all successors (job + machine)
++
++        successors = job_successors[task] + machine_successors[task]
++
++        if len(successors) == 0:
++            latest_end[task] = makespan
++        else:
++            # Latest end = min of latest starts of all successors
++            successor_latest_starts = []
++            for succ in successors:
++                if succ in latest_start:
++                    successor_latest_starts.append(latest_start[succ])
++
++            if successor_latest_starts:
++                latest_end[task] = min(successor_latest_starts)
++            else:
++                latest_end[task] = makespan
++
++        latest_start[task] = latest_end[task] - duration
++
++    # Compute slack and identify critical tasks
++    critical_tasks = set()
++    slack_values = {}
++
++    for task in all_tasks:
++        slack = latest_start[task] - earliest_start[task]
++        slack_values[task] = slack
++
++        if abs(slack) < EPS:  # Zero slack = critical
++            critical_tasks.add(task)
++
++    return critical_tasks
++
++
++def compute_critical_path_labels(
++    tasks_dict: Dict[Tuple[int, int], int],
++    overlapping_task_indices: List[Tuple[int, int]],
++    critical_tasks: Set[Tuple[int, int]]
++) -> Tuple[List[int], List[int]]:
++    """
++    Generate critical path labels for training data.
++
++    Args:
++        tasks_dict: {(job_id, task_id): task_index} mapping
++        overlapping_task_indices: List of (job_id, task_id) in overlap region
++        critical_tasks: Set of (job_id, task_id) on critical path
++
++    Returns:
++        task_critical_idx: List of task indices (same as task_label_idx)
++        task_critical_label: List of binary labels (1 if on critical path, 0 otherwise)
++    """
++    task_critical_idx = [tasks_dict[task] for task in overlapping_task_indices]
++    task_critical_label = [1 if task in critical_tasks else 0
++                           for task in overlapping_task_indices]
++
++    return task_critical_idx, task_critical_label
++
++
++def get_critical_path_from_oracle(
++    jobs_data_sel: Dict,
++    jobs_solution_oracle: Dict,
++    overlapping_machines_assignment_all: Dict,
++    n_machines: int,
++    overlapping_task_indices: List[Tuple[int, int]]
++) -> Tuple[Set[Tuple[int, int]], float]:
++    """
++    Compute critical path from oracle solution for the overlap region.
++
++    This function is designed to be called during training data collection
++    to generate critical path labels alongside fix/not-fix labels.
++
++    Args:
++        jobs_data_sel: Job data for current window
++        jobs_solution_oracle: Oracle solution (tasks to fix)
++        overlapping_machines_assignment_all: Machine assignments in overlap
++        n_machines: Number of machines
++        overlapping_task_indices: Tasks in overlap region
++
++    Returns:
++        critical_tasks: Set of critical (job_id, task_id) tuples
++        critical_ratio: Ratio of critical tasks to total overlap tasks
++    """
++    # Build a solution dict for overlap tasks only
++    # Note: jobs_solution_oracle only contains tasks that should be fixed
++    # We need the full solution for critical path analysis
++
++    # For critical path, we need the actual scheduling info
++    # This comes from overlapping_machines_assignment_all
++
++    # Reconstruct jobs_solution from machine assignments
++    jobs_solution_overlap = {}
++    for machine, tasks in overlapping_machines_assignment_all.items():
++        for task in tasks:
++            task_key = (task.job, task.index)
++            if task_key in overlapping_task_indices:
++                # Find the selected alternative
++                if task_key in jobs_data_sel.get(task.job, {}):
++                    task_data = jobs_data_sel[task.job][task_key[1]]
++                    for alt_id, (dur, mach) in task_data.items():
++                        if mach == machine and dur == task.duration:
++                            jobs_solution_overlap[task_key] = (alt_id, machine, task.start, task.duration)
++                            break
++
++    if len(jobs_solution_overlap) == 0:
++        return set(), 0.0
++
++    # Compute critical path
++    critical_tasks = compute_critical_path(
++        jobs_data_sel,
++        jobs_solution_overlap,
++        overlapping_machines_assignment_all,
++        n_machines
++    )
++
++    # Filter to only include tasks in overlap region
++    critical_tasks_overlap = critical_tasks & set(overlapping_task_indices)
++
++    # Compute ratio
++    critical_ratio = len(critical_tasks_overlap) / max(len(overlapping_task_indices), 1)
++
++    return critical_tasks_overlap, critical_ratio
++
++
++def analyze_critical_path_distribution(
++    critical_tasks: Set[Tuple[int, int]],
++    oracle_fix_tasks: Set[Tuple[int, int]],
++    overlapping_task_indices: List[Tuple[int, int]]
++) -> Dict[str, float]:
++    """
++    Analyze the relationship between critical path and fix decisions.
++
++    This helps understand if critical path awareness can improve predictions.
++
++    Args:
++        critical_tasks: Set of tasks on critical path
++        oracle_fix_tasks: Set of tasks oracle decided to fix
++        overlapping_task_indices: All tasks in overlap
++
++    Returns:
++        Dictionary with analysis statistics
++    """
++    overlap_set = set(overlapping_task_indices)
++
++    # Filter to overlap region
++    critical_in_overlap = critical_tasks & overlap_set
++    fix_in_overlap = oracle_fix_tasks & overlap_set
++
++    # Compute overlaps
++    critical_and_fix = critical_in_overlap & fix_in_overlap
++    critical_not_fix = critical_in_overlap - fix_in_overlap
++    fix_not_critical = fix_in_overlap - critical_in_overlap
++
++    n_overlap = len(overlap_set)
++    n_critical = len(critical_in_overlap)
++    n_fix = len(fix_in_overlap)
++
++    stats = {
++        'total_overlap': n_overlap,
++        'num_critical': n_critical,
++        'num_fix': n_fix,
++        'critical_ratio': n_critical / max(n_overlap, 1),
++        'fix_ratio': n_fix / max(n_overlap, 1),
++        'critical_and_fix': len(critical_and_fix),
++        'critical_not_fix': len(critical_not_fix),
++        'fix_not_critical': len(fix_not_critical),
++        # P(fix | critical): probability a critical task is fixed
++        'prob_fix_given_critical': len(critical_and_fix) / max(n_critical, 1),
++        # P(critical | fix): probability a fixed task is critical
++        'prob_critical_given_fix': len(critical_and_fix) / max(n_fix, 1),
++    }
++
++    return stats
+diff -urN makespan/flexible_jss_data.py makespan/flexible_jss_data.py
+--- makespan/flexible_jss_data.py	2026-04-21 04:59:07.227007659 -0400
++++ makespan/flexible_jss_data.py	2026-04-21 04:59:07.226007708 -0400
+@@ -1,9 +1,10 @@
+ import numpy as np
+-from flexible_jss_data_common import FlexibleJSSData, get_task_index, get_edges, get_label, get_dummy_label
++from flexible_jss_data_common import FlexibleJSSData, get_task_index, get_edges, get_label, get_dummy_label, get_critical_label
++from critical_path_utils import compute_critical_path
+ 
+ def get_data(jobs_data_sel, n_machines, machines_start_time, jobs_start_time,
+              overlapping_task_indices, overlapping_jobs_solution_all, overlapping_machines_assignment_all,
+-             overlapping_jobs_solution_oracle):
++             overlapping_jobs_solution_oracle, compute_critical=True):
+     '''
+     jobs_data_sel: {job_id: {task_id: {alt_id: (duration, machine), ... }}}
+     machines_start_time: [start_time for _ in range(n_machines)]
+@@ -11,6 +12,7 @@
+     overlapping_task_indices: [(job_id, task_id)]
+     overlapping_jobs_solution_all: {(job_id, task_id): (selected_alt, machine, start_value, duration)} (prev iter, overlap)
+     machines_assignment_all: {machine: [assigned_task_type(start=start_value, job=job_id, index=task_id, duration=duration)]} (prev iter, overlap)
++    compute_critical: Whether to compute critical path labels (for multi-task learning)
+     '''
+ 
+     x_tasks, tasks_tuple, tasks_dict, x_machines, \
+@@ -25,13 +27,40 @@
+ 
+     task_label_idx, task_label = get_label(tasks_dict, overlapping_task_indices, overlapping_jobs_solution_oracle)
+ 
++    # Compute critical path labels for multi-task learning
++    task_critical_idx, task_critical_label = [], []
++    if compute_critical and len(overlapping_jobs_solution_all) > 0:
++        try:
++            # Compute critical path from the current solution
++            critical_tasks = compute_critical_path(
++                jobs_data_sel,
++                overlapping_jobs_solution_all,
++                overlapping_machines_assignment_all,
++                n_machines
++            )
++            # Filter to only include tasks in overlap region
++            critical_tasks_overlap = critical_tasks & set(overlapping_task_indices)
++            task_critical_idx, task_critical_label = get_critical_label(
++                tasks_dict, overlapping_task_indices, critical_tasks_overlap
++            )
++
++            # Print statistics
++            n_critical = sum(task_critical_label)
++            n_fix = sum(task_label)
++            print(f'Critical path: {n_critical}/{len(overlapping_task_indices)} tasks '
++                  f'(Fix: {n_fix}, Critical&Fix: {sum(c and f for c, f in zip(task_critical_label, task_label))})')
++        except Exception as e:
++            print(f'Warning: Failed to compute critical path: {e}')
++            task_critical_idx = task_label_idx.copy()
++            task_critical_label = [0] * len(task_label_idx)
+ 
+     data = FlexibleJSSData(x_tasks, x_machines,
+                            overlap_machine_task_edge_idx, overlap_machine_task_edge_val, \
+                            other_machine_task_edge_idx, other_machine_task_edge_val, \
+                            task_precedence_edge_idx, task_precedence_edge_val,
+                            task_solution_edge_idx, task_solution_edge_val,
+-                           task_label_idx, task_label)
++                           task_label_idx, task_label,
++                           task_critical_idx, task_critical_label)
+     return {'data': data, 'tasks_tuple': tasks_tuple, 'tasks_dict': tasks_dict}
+ 
+ 
+@@ -48,12 +77,17 @@
+                                                                    overlapping_machines_assignment_all)
+ 
+     task_label_idx, task_label = get_dummy_label(tasks_dict, overlapping_task_indices)
++    # Dummy critical path labels for rollout (we don't have ground truth at inference time)
++    task_critical_idx = task_label_idx.copy()
++    task_critical_label = [0 for _ in range(len(task_label_idx))]
++
+     data = FlexibleJSSData(x_tasks, x_machines,
+                            overlap_machine_task_edge_idx, overlap_machine_task_edge_val, \
+                            other_machine_task_edge_idx, other_machine_task_edge_val, \
+                            task_precedence_edge_idx, task_precedence_edge_val,
+                            task_solution_edge_idx, task_solution_edge_val,
+-                           task_label_idx, task_label)
++                           task_label_idx, task_label,
++                           task_critical_idx, task_critical_label)
+     return {'data': data, 'tasks_tuple': tasks_tuple, 'tasks_dict': tasks_dict}
+ 
+ 
+diff -urN makespan/flexible_jss_data_common.py makespan/flexible_jss_data_common.py
+--- makespan/flexible_jss_data_common.py	2026-04-21 04:59:07.227007659 -0400
++++ makespan/flexible_jss_data_common.py	2026-04-21 04:59:07.226007708 -0400
+@@ -15,7 +15,8 @@
+                  other_machine_task_edge_idx, other_machine_task_edge_val,
+                  task_precedence_edge_idx, task_precedence_edge_val,
+                  task_solution_edge_idx, task_solution_edge_val,
+-                 task_label_idx, task_label):
++                 task_label_idx, task_label,
++                 task_critical_idx=None, task_critical_label=None):
+         super().__init__()
+         self.x_tasks = x_tasks
+         self.x_machines = x_machines
+@@ -29,15 +30,18 @@
+         self.task_solution_edge_val = task_solution_edge_val
+         self.task_label_idx = task_label_idx
+         self.task_label = task_label
++        # Critical path labels (for multi-task learning)
++        self.task_critical_idx = task_critical_idx if task_critical_idx is not None else []
++        self.task_critical_label = task_critical_label if task_critical_label is not None else []
+ 
+     def __inc__(self, key, value, *args, **kwargs):
+         if key in ['x_tasks', 'x_machines', 'overlap_machine_task_edge_val', 'other_machine_task_edge_val',
+-                   'task_precedence_edge_val', 'task_solution_edge_val', 'task_label']:
++                   'task_precedence_edge_val', 'task_solution_edge_val', 'task_label', 'task_critical_label']:
+             inc = 0
+         elif key in ['task_precedence_edge_idx', 'task_solution_edge_idx']:
+             inc = torch.tensor([[self.x_tasks.size(0)],
+                                 [self.x_tasks.size(0)]])
+-        elif key in ['task_label_idx']:
++        elif key in ['task_label_idx', 'task_critical_idx']:
+             inc = self.x_tasks.size(0)
+         elif key in ['overlap_machine_task_edge_idx', 'other_machine_task_edge_idx']:
+             inc = torch.tensor([[self.x_machines.size(0)],
+@@ -51,7 +55,8 @@
+     def __cat_dim__(self, key, value, *args, **kwargs):
+         if key in ['x_tasks', 'x_machines', 'overlap_machine_task_edge_val',
+                    'other_machine_task_edge_val', 'task_precedence_edge_val',
+-                   'task_solution_edge_val', 'task_label_idx', 'task_label']:
++                   'task_solution_edge_val', 'task_label_idx', 'task_label',
++                   'task_critical_idx', 'task_critical_label']:
+             cat_dim = 0
+         elif key in ['task_precedence_edge_idx', 'task_solution_edge_idx',
+                      'overlap_machine_task_edge_idx', 'other_machine_task_edge_idx']:
+@@ -222,6 +227,24 @@
+     return task_label_idx, task_label
+ 
+ 
++def get_critical_label(tasks_index, overlapping_task_indices, critical_tasks):
++    """
++    Generate critical path labels for multi-task learning.
++
++    Args:
++        tasks_index: {(job_id, task_id): task_index} mapping
++        overlapping_task_indices: List of (job_id, task_id) in overlap region
++        critical_tasks: Set of (job_id, task_id) on critical path
++
++    Returns:
++        task_critical_idx: List of task indices (same as task_label_idx)
++        task_critical_label: List of binary labels (1 if on critical path, 0 otherwise)
++    """
++    task_critical_idx = [tasks_index[task] for task in overlapping_task_indices]
++    task_critical_label = [1 if task in critical_tasks else 0 for task in overlapping_task_indices]
++    return task_critical_idx, task_critical_label
++
++
+ def get_dataloader(dataset, batch_size=64, shuffle=True, follow_batch=['x_tasks', 'x_machines'], num_workers=0,
+                    pin_memory=False):
+     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, follow_batch=follow_batch,
